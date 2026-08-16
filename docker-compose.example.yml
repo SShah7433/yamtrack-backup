@@ -1,0 +1,26 @@
+# Example deployment: add this service to the compose file that runs Yamtrack.
+#
+# Paths below assume this sits alongside a SQLite Yamtrack stack, i.e. the
+# database is bind-mounted at ./db and the GCS service account key is saved as
+# ./gcs-key.json next to the compose file.
+services:
+  backup:
+    image: ghcr.io/sshah7433/yamtrack-backup:latest
+    container_name: yamtrack-backup
+    restart: unless-stopped
+    environment:
+      # Match the timezone on the yamtrack service so BACKUP_SCHEDULE means
+      # what you expect.
+      - TZ=Europe/Berlin
+      - BACKUP_BUCKET=your-yamtrack-backups
+      - BACKUP_PREFIX=daily
+      - BACKUP_SCHEDULE=04:00
+      - YAMTRACK_DB=/db/db.sqlite3
+      - GOOGLE_APPLICATION_CREDENTIALS=/secrets/gcs-key.json
+      # Optional dead-man switch; alerts you when a run stops happening.
+      # - BACKUP_HEALTHCHECK_URL=https://hc-ping.com/your-uuid-here
+    volumes:
+      # Read-write is required, not a mistake: a SQLite reader in WAL mode must
+      # be able to attach to (and sometimes create) the -shm sidecar file.
+      - ./db:/db
+      - ./gcs-key.json:/secrets/gcs-key.json:ro

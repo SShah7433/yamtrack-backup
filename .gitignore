@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# Never commit service account keys or local compose overrides.
+gcs-key.json
+*.json.key
+docker-compose.override.yml

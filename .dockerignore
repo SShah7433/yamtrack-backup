@@ -1,0 +1,9 @@
+.git
+.github
+.gitignore
+.pytest_cache
+__pycache__
+*.md
+test_*.py
+docker-compose*.yml
+gcs-key.json
