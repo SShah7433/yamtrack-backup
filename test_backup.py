@@ -74,6 +74,58 @@ def test_snapshot_round_trips_through_compression(live_database, tmp_path):
     connection.close()
 
 
+def test_restore_replaces_database_and_removes_wal_sidecars(live_database, tmp_path):
+    """A verified archive atomically becomes the target database."""
+    source_path, _writer = live_database
+    snapshot_path = tmp_path / "snapshot.sqlite3"
+    archive_path = tmp_path / "snapshot.sqlite3.gz"
+    target_path = tmp_path / "target.sqlite3"
+
+    backup.snapshot_database(source_path, snapshot_path)
+    backup.compress(snapshot_path, archive_path)
+    target_path.write_bytes(b"not a database")
+    target_path.with_name("target.sqlite3-wal").write_bytes(b"stale wal")
+    target_path.with_name("target.sqlite3-shm").write_bytes(b"stale shm")
+
+    backup.restore_database(archive_path, target_path)
+
+    connection = sqlite3.connect(target_path)
+    assert connection.execute("SELECT COUNT(*) FROM media").fetchone()[0] == 1000
+    connection.close()
+    assert not target_path.with_name("target.sqlite3-wal").exists()
+    assert not target_path.with_name("target.sqlite3-shm").exists()
+
+
+def test_restore_does_not_replace_database_with_an_invalid_archive(tmp_path):
+    """A broken archive leaves the current database untouched."""
+    archive_path = tmp_path / "broken.sqlite3.gz"
+    target_path = tmp_path / "target.sqlite3"
+    target_path.write_bytes(b"existing database contents")
+    archive_path.write_bytes(b"not a gzip archive")
+
+    with pytest.raises(OSError):
+        backup.restore_database(archive_path, target_path)
+
+    assert target_path.read_bytes() == b"existing database contents"
+
+
+@pytest.mark.parametrize(
+    ("uri", "expected"),
+    [
+        ("gs://backups/daily/example.sqlite3.gz", ("backups", "daily/example.sqlite3.gz")),
+        ("gs://bucket/object", ("bucket", "object")),
+    ],
+)
+def test_parse_gcs_uri(uri, expected):
+    assert backup.parse_gcs_uri(uri) == expected
+
+
+@pytest.mark.parametrize("uri", ["daily/example.gz", "gs://bucket", "gs:///object"])
+def test_parse_gcs_uri_rejects_incomplete_uris(uri):
+    with pytest.raises(ValueError):
+        backup.parse_gcs_uri(uri)
+
+
 def test_snapshot_excludes_writes_made_after_it_started(live_database, tmp_path):
     """The snapshot is a point-in-time copy, not a live view of the database."""
     source_path, writer = live_database
@@ -189,3 +241,8 @@ def test_healthcheck_errors_never_propagate(monkeypatch):
     monkeypatch.setattr(httpx, "get", failing_get)
 
     backup.ping_healthcheck("https://example.invalid/ping")  # must not raise
+
+
+def test_restore_cli_requires_confirmation():
+    """The destructive CLI mode is unavailable without an explicit opt-in."""
+    assert backup.main(["--restore", "gs://backups/daily/example.sqlite3.gz"]) == 1

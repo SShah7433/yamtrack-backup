@@ -99,8 +99,9 @@ Nearline is roughly half the price of Standard and its 30-day minimum storage
 duration lines up exactly with the lifecycle rule above, so there is no
 early-deletion charge.
 
-`gcloud` is only needed for this one-time setup and for restores. The container
-itself talks to the GCS API directly and does not bundle the SDK.
+The backup service account needs only `roles/storage.objectCreator`. A restore
+needs read access as well, so use separate credentials with
+`roles/storage.objectViewer` when performing one.
 
 ## Configuration
 
@@ -116,16 +117,21 @@ itself talks to the GCS API directly and does not bundle the SDK.
 
 ## Restoring
 
+Stop Yamtrack first, then run the restore command using credentials that can
+read the selected backup object:
+
 ```bash
-gcloud storage cp gs://your-yamtrack-backups/daily/yamtrack-2026-08-15T040000Z.sqlite3.gz .
 docker compose stop yamtrack
-gunzip -c yamtrack-2026-08-15T040000Z.sqlite3.gz > ./db/db.sqlite3
-rm -f ./db/db.sqlite3-wal ./db/db.sqlite3-shm
+docker compose run --rm backup \
+  --restore gs://your-yamtrack-backups/daily/yamtrack-2026-08-15T040000Z.sqlite3.gz \
+  --confirm-restore
 docker compose start yamtrack
 ```
 
-Deleting the stale `-wal` and `-shm` sidecars matters: leaving them beside a
-restored database gives SQLite a misleading picture of its own state.
+The restore downloads, decompresses, and integrity-checks the backup before
+atomically replacing `YAMTRACK_DB`; it also removes stale `-wal` and `-shm`
+sidecars. `--confirm-restore` is required because this permanently replaces
+the database. Never restore while Yamtrack is running.
 
 Do this once into a throwaway copy of the stack now, while nothing is broken,
 so you know the chain works end to end.

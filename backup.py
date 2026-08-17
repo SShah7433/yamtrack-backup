@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Back up the Yamtrack SQLite database to Google Cloud Storage.
+"""Back up and restore the Yamtrack SQLite database with Google Cloud Storage.
 
 Takes a consistent online snapshot of the live database using SQLite's backup
 API, verifies its integrity, compresses it, and uploads the result to GCS.
@@ -129,6 +129,16 @@ def compress(source_path: Path, destination_path: Path) -> Path:
     return destination_path
 
 
+def decompress(source_path: Path, destination_path: Path) -> Path:
+    """Decompress a gzip archive to a SQLite database file.
+
+    The caller should verify the resulting database before making it live.
+    """
+    with gzip.open(source_path, "rb") as compressed, open(destination_path, "wb") as raw:
+        shutil.copyfileobj(compressed, raw)
+    return destination_path
+
+
 def upload(local_path: Path, bucket_name: str, object_name: str) -> str:
     """Upload a file to Google Cloud Storage.
 
@@ -158,6 +168,76 @@ def upload(local_path: Path, bucket_name: str, object_name: str) -> str:
     uri = f"gs://{bucket_name}/{object_name}"
     logger.info("Uploaded %s", uri)
     return uri
+
+
+def download(bucket_name: str, object_name: str, destination_path: Path) -> Path:
+    """Download a GCS object to a local file and return its path."""
+    blob = storage.Client().bucket(bucket_name).blob(object_name)
+    blob.download_to_filename(destination_path)
+    logger.info("Downloaded gs://%s/%s", bucket_name, object_name)
+    return destination_path
+
+
+def parse_gcs_uri(uri: str) -> tuple[str, str]:
+    """Split a gs:// URI into its bucket and object name.
+
+    Raises:
+        ValueError: If *uri* does not identify a GCS object.
+    """
+    if not uri.startswith("gs://"):
+        raise ValueError("Restore source must be a gs://bucket/object URI")
+
+    bucket_name, separator, object_name = uri[5:].partition("/")
+    if not bucket_name or not separator or not object_name:
+        raise ValueError("Restore source must include both a bucket and object name")
+    return bucket_name, object_name
+
+
+def restore_database(archive_path: Path, destination_path: Path) -> None:
+    """Validate and atomically restore a compressed SQLite backup.
+
+    The replacement is performed only after decompression and SQLite's
+    integrity check succeed. SQLite WAL sidecar files from the old database are
+    removed after the replacement so they cannot be replayed against it.
+    """
+    if not destination_path.parent.is_dir():
+        raise RuntimeError(f"Database directory does not exist: {destination_path.parent}")
+
+    with tempfile.NamedTemporaryFile(
+        prefix=f".{destination_path.name}.restore-",
+        suffix=".sqlite3",
+        dir=destination_path.parent,
+        delete=False,
+    ) as temporary:
+        restored_path = Path(temporary.name)
+
+    try:
+        decompress(archive_path, restored_path)
+        verify_snapshot(restored_path)
+        os.replace(restored_path, destination_path)
+    except Exception:
+        restored_path.unlink(missing_ok=True)
+        raise
+
+    for sidecar_suffix in ("-wal", "-shm"):
+        destination_path.with_name(destination_path.name + sidecar_suffix).unlink(
+            missing_ok=True
+        )
+    logger.info("Restored database to %s", destination_path)
+
+
+def run_restore(source_uri: str) -> bool:
+    """Download a backup from GCS and restore it to ``DATABASE_PATH``."""
+    try:
+        bucket_name, object_name = parse_gcs_uri(source_uri)
+        with tempfile.TemporaryDirectory(prefix="yamtrack-restore-") as workspace:
+            archive_path = Path(workspace) / "backup.sqlite3.gz"
+            download(bucket_name, object_name, archive_path)
+            restore_database(archive_path, DATABASE_PATH)
+    except Exception:
+        logger.exception("Restore failed; the existing database was not replaced")
+        return False
+    return True
 
 
 def ping_healthcheck(url: str | None, *, failed: bool = False) -> None:
@@ -262,15 +342,36 @@ def main(argv: list[str] | None = None) -> int:
         transient problem does not take the service down.
     """
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument(
         "--once",
         action="store_true",
         help="Take a single backup and exit instead of scheduling daily runs.",
     )
+    mode.add_argument(
+        "--restore",
+        metavar="GS_URI",
+        help="Restore this gs://bucket/object backup to YAMTRACK_DB and exit.",
+    )
+    parser.add_argument(
+        "--confirm-restore",
+        action="store_true",
+        help="Required with --restore because it replaces the current database.",
+    )
     args = parser.parse_args(argv)
+
+    if args.confirm_restore and not args.restore:
+        parser.error("--confirm-restore can only be used with --restore")
 
     if args.once:
         return 0 if run_backup() else 1
+
+    if args.restore:
+        if not args.confirm_restore:
+            logger.error("--restore requires --confirm-restore")
+            return 1
+        logger.warning("Restoring %s to %s", args.restore, DATABASE_PATH)
+        return 0 if run_restore(args.restore) else 1
 
     try:
         seconds_until(SCHEDULE_TIME)  # fail fast on a malformed schedule
